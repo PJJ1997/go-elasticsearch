@@ -1,0 +1,3 @@
+# go-elasticsearch
+## go-elasticsearch常用方法案例
+还有elasticsearch的滚动查询待添加...
