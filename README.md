@@ -1,2 +1,2 @@
 ## go-elasticsearch常用方法案例
-还有elasticsearch的滚动查询待添加...
+ - elasticsearch的滚动查询补充 2021-01-09
