@@ -57,6 +57,24 @@ func main() {
 		fmt.Println(v.Source.EntityType)
 		fmt.Println(v.Source.RelationEntities)
 	}
+
+	// 滚动查询用法（一次过查询大数据量）
+	// es的size最多只能支持10000条
+	// esDocuments := []*ESDocument{}
+	esDocuments := make([]*ESDocument, 0)
+	var scrollID string
+	// 查询数据量：5 * 50000
+	for i := 0; i <= 5 && (i == 0 || scrollID != ""); i += 5000 {
+		from := int(i)
+		size := 5000
+		esPaginateResponse, tempScollID, err := scrollSearch(from, size, scrollID, "IndexName", client)
+		if err != nil {
+			return
+		}
+		scrollID = tempScollID
+		esDocuments = append(esDocuments, esPaginateResponse)
+	}
+	fmt.Println("esDocuments: ", esDocuments)
 }
 
 // 创建 ESClient
@@ -349,6 +367,217 @@ func scriptScoreQuery() map[string]interface{} {
 		},
 	}
 	return query
+}
+
+// 第一次滚动查询时需要要调用，返回scollID，供下一次滚动查询调用
+func PerformESQueryAndBuildScroll(query map[string]interface{}, index string, esClient *elasticsearch.Client) ([]map[string]interface{}, string, error) {
+
+	startTime := time.Now()
+
+	resultList := make([]map[string]interface{}, 0)
+	var err error
+
+	var reqBody bytes.Buffer
+	err = json.NewEncoder(&reqBody).Encode(query)
+	if err != nil {
+		err = fmt.Errorf("encode query failed, %v", err)
+		return resultList, "", errors.WithStack(err)
+	}
+	res, err := esClient.Search(
+		esClient.Search.WithContext(context.Background()),
+		esClient.Search.WithIndex(string(index)),
+		esClient.Search.WithBody(&reqBody),
+		esClient.Search.WithTrackTotalHits(true),
+		esClient.Search.WithPretty(),
+		esClient.Search.WithTimeout(5*60*time.Second),
+		esClient.Search.WithScroll(time.Minute),
+	)
+	if err != nil {
+		err = fmt.Errorf("Error getting response: %s", err)
+		return resultList, "", errors.WithStack(err)
+	}
+	defer res.Body.Close()
+
+	if res.IsError() {
+		var e map[string]interface{}
+		if err = json.NewDecoder(res.Body).Decode(&e); err != nil {
+			err = fmt.Errorf("Error parsing the response body: %s", err)
+		} else {
+			err = fmt.Errorf("[%s] %s: %s", res.Status(),
+				e["error"].(map[string]interface{})["type"],
+				e["error"].(map[string]interface{})["reason"])
+		}
+		return resultList, "", errors.WithStack(err)
+	}
+
+	result := make(map[string]interface{})
+	if err = json.NewDecoder(res.Body).Decode(&result); err != nil {
+		err = fmt.Errorf("Error parsing the response body: %s", err)
+		return resultList, "", errors.WithStack(err)
+	}
+	resultList = append(resultList, result)
+
+	hits := result["hits"].(map[string]interface{})["hits"].([]interface{})
+
+	scrollID := ""
+	if len(hits) == query["size"].(int) {
+		scrollID = result["_scroll_id"].(string)
+	}
+
+	// test code
+	if len(hits) > 0 {
+		log.Println("")
+		log.Println("---------------- First level of PerformESQueryAndBuildScroll ---------------")
+		length := len(hits)
+		if length > 1 {
+			length = 1
+		}
+		resultJSON, _ := json.Marshal(hits[0:length])
+		log.Printf("adam Build scroll, result[%+v]", string(resultJSON))
+		log.Printf("adam Build scroll, len(hits): [%+v], query time[%+v]", len(hits), time.Now().Sub(startTime))
+	}
+
+	return resultList, scrollID, err
+}
+
+// 调用第一次滚动查询方法，将返回结果封装好
+func GetESDataAndBuildScroll(query map[string]interface{}, index string, esClient *elasticsearch.Client) (*ESDocument, string, error) {
+	resultList, scrollID, err := PerformESQueryAndBuildScroll(query, index, esClient)
+	if err != nil {
+		return nil, "", errors.WithStack(err)
+	}
+
+	response := ESDocument{}
+	for _, v := range resultList {
+		res := new(ESDocument)
+		jsonData, err := json.Marshal(v)
+		if err != nil {
+			return nil, "", errors.WithStack(err)
+		}
+		err = json.Unmarshal(jsonData, &res)
+		if err != nil {
+			return nil, "", errors.WithStack(err)
+		}
+
+		response.OuterHits.Total.Value = res.OuterHits.Total.Value
+		response.OuterHits.InnerHits = append(response.OuterHits.InnerHits, res.OuterHits.InnerHits...)
+	}
+
+	return &response, scrollID, nil
+}
+
+// 第二次及以上调用滚动查询，根据scrollID查询
+func PerformESQueryWithScroll(scrollID string, esClient *elasticsearch.Client) ([]map[string]interface{}, string, error) {
+	if scrollID == "" {
+		return nil, "", fmt.Errorf("=========================*************scrollID can not be empty in adam.PerformESQueryWithScroll")
+	}
+
+	resultList := make([]map[string]interface{}, 0)
+	startTime := time.Now()
+
+	res, err := esClient.Scroll(
+		esClient.Scroll.WithContext(context.Background()),
+		esClient.Scroll.WithPretty(),
+		esClient.Scroll.WithScrollID(scrollID),
+		esClient.Scroll.WithScroll(time.Minute),
+	)
+	if err != nil {
+		err = fmt.Errorf("Error getting response: %s", err)
+		return resultList, "", errors.WithStack(err)
+	}
+	defer res.Body.Close()
+
+	if res.IsError() {
+		var e map[string]interface{}
+		if err = json.NewDecoder(res.Body).Decode(&e); err != nil {
+			err = fmt.Errorf("Error parsing the response body: %s", err)
+		} else {
+			err = fmt.Errorf("[%s] %s: %s", res.Status(),
+				e["error"].(map[string]interface{})["type"],
+				e["error"].(map[string]interface{})["reason"])
+		}
+		return resultList, "", errors.WithStack(err)
+	}
+
+	result := make(map[string]interface{})
+	if err = json.NewDecoder(res.Body).Decode(&result); err != nil {
+		err = fmt.Errorf("Error parsing the response body: %s", err)
+		return resultList, "", errors.WithStack(err)
+	}
+
+	resultList = append(resultList, result)
+
+	scrollID = ""
+	hits := result["hits"].(map[string]interface{})["hits"].([]interface{})
+	if len(hits) > 0 {
+		scrollID = result["_scroll_id"].(string)
+	}
+
+	// test code
+	if len(hits) > 0 {
+		log.Println("---------------- Second level of PerformESQueryWithScroll ---------------")
+		resultJSON, _ := json.Marshal(hits[0])
+		log.Printf("adam PerformESQueryWithScroll， len(resultList)[%d], len(hits)[%d], query time: [%+v]",
+			len(resultList), len(hits), time.Now().Sub(startTime))
+		log.Printf("adam PerformESQueryWithScroll， hits[0]: [%+v]", string(resultJSON))
+	}
+
+	return resultList, scrollID, nil
+}
+
+// 调用第二次及以上的滚动查询方法，将返回结果封装好
+func GetESDataWithScroll(scrollID string, esClient *elasticsearch.Client) (*ESDocument, string, error) {
+	resultList, scrollID, err := PerformESQueryWithScroll(scrollID, esClient)
+	if err != nil {
+		return nil, "", errors.WithStack(err)
+	}
+
+	response := ESDocument{}
+	for _, v := range resultList {
+		res := new(ESDocument)
+		jsonData, err := json.Marshal(v)
+		if err != nil {
+			return nil, "", errors.WithStack(err)
+		}
+		err = json.Unmarshal(jsonData, &res)
+		if err != nil {
+			return nil, "", errors.WithStack(err)
+		}
+
+		response.OuterHits.Total.Value = res.OuterHits.Total.Value
+		response.OuterHits.InnerHits = append(response.OuterHits.InnerHits, res.OuterHits.InnerHits...)
+	}
+
+	return &response, scrollID, nil
+}
+
+func scrollSearch(from, size int, scrollID string, esIndex string, client *elasticsearch.Client) (*ESDocument, string, error) {
+	queryResponse := new(ESDocument)
+	indexName := esIndex
+
+	query := map[string]interface{}{
+		"size": size,
+		// 其他查询条件...
+	}
+	// 第一页查询，保证最后一页之后 scrollID 为空时不再执行查询
+	if from == 0 {
+		queryResponse, scrollIDResult, err := GetESDataAndBuildScroll(query, indexName, client)
+		if err != nil {
+			return nil, "", err
+		}
+
+		return queryResponse, scrollIDResult, nil
+	}
+	if scrollID != "" {
+		queryResponse, scrollIDResult, err := GetESDataWithScroll(scrollID, client)
+		if err != nil {
+			return nil, scrollIDResult, err
+		}
+
+		return queryResponse, scrollIDResult, nil
+	}
+
+	return queryResponse, "", nil
 }
 
 // ================================ es 的删除更新插入 ================================
